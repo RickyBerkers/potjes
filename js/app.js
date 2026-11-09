@@ -1,9 +1,11 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
 import { getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-import { getFirestore, collection, getDocs, doc, setDoc, updateDoc, addDoc, writeBatch, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+import { getFirestore, collection, getDocs, getDoc, doc, setDoc, updateDoc, addDoc, writeBatch, serverTimestamp, query, where } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import * as XLSX from "https://cdn.sheetjs.com/xlsx-0.20.3/package/xlsx.mjs";
 
-import { firebaseConfig, toegestaneEmails, raboDoelStorting, startDatum } from "./config.js";
+import { firebaseConfig, toegestaneEmails, eigenaarEmail, raboDoelStorting, startDatum, spaarpot } from "./config.js";
+import { maandOverzicht, spaarStatus } from "./spaar.js";
+import { periodeVanBoeking, periodeVandaag, periodeNaam, verstreken } from "./periode.js";
 import { standaardPotjes } from "./potjes.js";
 import { parseAbnRows, parseRaboCsv, gatControle } from "./parse.js";
 import { sorteerRegels, deelIn } from "./rules.js";
@@ -12,7 +14,12 @@ const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 
-const S = { user: null, boekingen: new Map(), regels: [], potjes: {}, rekeningen: {}, maand: null, tab: "maand", import: null, open: null };
+const S = { user: null, boekingen: new Map(), regels: [], potjes: {}, rekeningen: {}, abnSamenvatting: { maanden: {} }, maand: null, tab: "maand", import: null, open: null };
+const isEigenaar = () => S.user?.email === eigenaarEmail;
+// Potjes waarvan de boekingen alleen voor de eigenaar zichtbaar zijn.
+const isPrive = (p) => p.rekening === "abn" || ["zakelijk", "inkomen", "apart"].includes(p.soort);
+// Oude namen die bij het laden worden bijgewerkt.
+const hernoem = { "lening-duo": "Leningen" };
 
 // ---------- hulpfuncties ----------
 const $ = (sel) => document.querySelector(sel);
@@ -59,13 +66,20 @@ onAuthStateChanged(auth, async (user) => {
 // ---------- laden ----------
 async function laadAlles() {
   melding("Laden…");
-  const [bSnap, rSnap, pSnap, kSnap] = await Promise.all([
-    getDocs(collection(db, "boekingen")), getDocs(collection(db, "regels")),
-    getDocs(collection(db, "potjes")), getDocs(collection(db, "rekeningen")),
-  ]);
+  const eig = isEigenaar();
+  const boekQ = eig ? collection(db, "boekingen") : query(collection(db, "boekingen"), where("rekening", "==", "rabo"));
+  const [bSnap, rSnap, pSnap] = await Promise.all([getDocs(boekQ), getDocs(collection(db, "regels")), getDocs(collection(db, "potjes"))]);
   S.boekingen = new Map(bSnap.docs.map((d) => [d.id, { id: d.id, ...d.data() }]));
   S.regels = sorteerRegels(rSnap.docs.map((d) => ({ id: d.id, ...d.data() })));
-  S.rekeningen = Object.fromEntries(kSnap.docs.map((d) => [d.id, d.data()]));
+  S.rekeningen = {};
+  for (const r of eig ? ["abn", "rabo"] : ["rabo"]) {
+    const d = await getDoc(doc(db, "rekeningen", r));
+    if (d.exists()) S.rekeningen[r] = d.data();
+  }
+  if (!eig) {
+    const sam = await getDoc(doc(db, "samenvattingen", "abn"));
+    S.abnSamenvatting = sam.exists() ? sam.data() : { maanden: {} };
+  }
   S.potjes = Object.fromEntries(pSnap.docs.map((d) => [d.id, { code: d.id, ...d.data() }]));
   // Nieuwe standaardpotjes (uit een update van de app) aanvullen; bestaande budgetten blijven staan.
   const ontbrekend = standaardPotjes.filter((p) => !S.potjes[p.code]);
@@ -73,12 +87,51 @@ async function laadAlles() {
     await inBatches(ontbrekend, (b, p) => b.set(doc(db, "potjes", p.code), p));
     ontbrekend.forEach((p) => (S.potjes[p.code] = { ...p }));
   }
-  if (!S.maand) {
-    const laatste = [...S.boekingen.values()].map((b) => b.datum).sort().at(-1);
-    S.maand = (laatste || new Date().toISOString()).slice(0, 7);
+  for (const [code, naam] of Object.entries(hernoem)) {
+    if (S.potjes[code] && S.potjes[code].naam !== naam) {
+      await updateDoc(doc(db, "potjes", code), { naam });
+      S.potjes[code].naam = naam;
+    }
   }
+  // Eenmalige omzetting naar de spaarpot-opzet (versie 2).
+  const vak = S.potjes[spaarpot.potje];
+  if (vak && vak.versie !== 2) {
+    const upd = { naam: "Spaarpot vakantie", budget: spaarpot.maandDoel, soort: "spaar", versie: 2, startSaldo: vak.startSaldo ?? 0 };
+    await updateDoc(doc(db, "potjes", spaarpot.potje), upd);
+    Object.assign(vak, upd);
+  }
+  // Versie 3: leefgeld opgesplitst; het oude potje wordt "Contant en overig".
+  const lg = S.potjes.leefgeld;
+  if (lg && lg.versie !== 3) {
+    const upd = { naam: "Contant en overig", budget: 50, groep: "leefgeld", volgorde: 10.8, versie: 3 };
+    await updateDoc(doc(db, "potjes", "leefgeld"), upd);
+    Object.assign(lg, upd);
+  }
+  if (eig) await schrijfSamenvatting();
+  if (!S.maand) S.maand = alleMaanden()[0] || periodeVandaag();
   melding("");
   render();
+}
+
+// Totalen per potje per maand van de ABN, zodat Dorien de balken ziet zonder de boekingen.
+async function schrijfSamenvatting() {
+  if (!isEigenaar()) return;
+  const maanden = {};
+  for (const b of S.boekingen.values()) {
+    if (b.rekening !== "abn") continue;
+    const m = periodeVanBoeking(b);
+    const pot = ((maanden[m] ||= { potjes: {} }).potjes);
+    pot[b.potje] = Math.round(((pot[b.potje] || 0) + b.bedrag) * 100) / 100;
+  }
+  const spaar = maandOverzicht([...S.boekingen.values()], spaarpot.potje, spaarpot.uitgavePotje, periodeVanBoeking);
+  S.abnSamenvatting = { maanden, spaar };
+  await setDoc(doc(db, "samenvattingen", "abn"), { maanden, spaar, bijgewerkt: serverTimestamp() });
+}
+
+function alleMaanden() {
+  const m = new Set([...S.boekingen.values()].map(periodeVanBoeking));
+  if (!isEigenaar()) Object.keys(S.abnSamenvatting.maanden || {}).forEach((x) => m.add(x));
+  return [...m].sort().reverse();
 }
 
 // ---------- navigatie ----------
@@ -96,18 +149,22 @@ function render() {
 
 // ---------- Deze maand ----------
 function renderMaand(el) {
-  const maanden = [...new Set([...S.boekingen.values()].map((b) => b.datum.slice(0, 7)))].sort().reverse();
+  const eig = isEigenaar();
+  const maanden = alleMaanden();
   if (!maanden.length) {
-    el.innerHTML = `<div class="kaart"><h2>Nog geen boekingen</h2><p>Ga naar <b>Importeren</b> en upload een export van de ABN en de Rabo. Zet eerst bij <b>Instellingen</b> de startregels erin.</p></div>`;
+    el.innerHTML = `<div class="kaart"><h2>Nog geen boekingen</h2><p>Ga naar <b>Importeren</b> en upload een export${eig ? " van de ABN en de Rabo" : " van de Rabo"}. Zet eerst bij <b>Instellingen</b> de startregels erin.</p></div>`;
     return;
   }
   if (!maanden.includes(S.maand)) S.maand = maanden[0];
-  const deze = [...S.boekingen.values()].filter((b) => b.datum.startsWith(S.maand));
+  const deze = [...S.boekingen.values()].filter((b) => periodeVanBoeking(b) === S.maand);
   const perPotje = {};
   for (const b of deze) (perPotje[b.potje] ||= []).push(b);
   const som = (lijst) => (lijst || []).reduce((s, b) => s + b.bedrag, 0);
+  // Voor Dorien: ABN-deel per potje uit de samenvatting (zonder losse boekingen).
+  const abnDeel = (code) => (eig ? 0 : ((S.abnSamenvatting.maanden || {})[S.maand]?.potjes?.[code] || 0));
+  const totaal = (code) => som(perPotje[code]) + abnDeel(code);
 
-  const storting = -som((perPotje.intern || []).filter((b) => b.rekening === "abn" && b.bedrag < 0));
+  const storting = som((perPotje.intern || []).filter((b) => b.rekening === "rabo" && b.bedrag > 0));
   const inkomen = ["in-salaris", "in-toeslag", "in-omzet"].map((c) => [c, som(perPotje[c])]);
   const storno = deze.filter((b) => b.label === "storno");
   const nToewijzen = (perPotje.toewijzen || []).length;
@@ -119,46 +176,118 @@ function renderMaand(el) {
 
   const balk = (p) => {
     const lijst = perPotje[p.code] || [];
-    const besteed = -som(lijst);
+    const besteed = -totaal(p.code);
     const pct = p.budget ? besteed / p.budget : 0;
-    const kleur = !p.budget ? "" : pct > 1 ? "rood" : pct > 0.8 ? "oranje" : "groen";
-    const open = S.open === p.code;
+    const spaar = p.soort === "spaar";
+    const kleur = kleurVoor(p, besteed);
+    const magOpen = eig || !isPrive(p);
+    const open = magOpen && S.open === p.code;
+    const verborgen = -abnDeel(p.code);
     return `<div class="potje" data-code="${esc(p.code)}">
-      <div class="potje-kop"><span>${esc(p.naam)}</span><span>${eur(besteed)}${p.budget ? ` <small>/ ${eur(p.budget)}</small>` : ""}</span></div>
+      <div class="potje-kop ${magOpen ? "klikbaar" : "dicht"}"><span>${esc(p.naam)}${magOpen ? "" : ' <small class="slot">alleen Ricky</small>'}</span><span>${eur(besteed)}${p.budget ? ` <small>/ ${eur(p.budget)}</small>` : ""}</span></div>
+      ${p.nulDoel ? `<div class="over ${besteed > 0.005 ? "neg" : ""}">${besteed > 0.005 ? "doel is € 0: stap over op direct betalen" : "niets achteraf betaald ✓"}</div>` : ""}
       ${p.budget ? `<div class="balk"><div class="vul ${kleur}" style="width:${Math.min(100, Math.max(0, pct * 100))}%"></div></div>
-      <div class="over ${besteed > p.budget ? "neg" : ""}">${besteed > p.budget ? `${eur(besteed - p.budget)} over budget` : `${eur(p.budget - besteed)} over`}</div>` : ""}
-      ${open ? lijstHtml(lijst) : ""}
+      <div class="over ${kleur}">${overTekst(p, besteed, klaar)}</div>` : ""}
+      ${open ? lijstHtml(lijst) + (verborgen ? `<div class="lijst"><small>Plus ${eur2(verborgen)} via de ABN-rekening van Ricky.</small></div>` : "") : ""}
     </div>`;
   };
-  const groep = (soorten) => potjeLijst().filter((p) => soorten.includes(p.soort) && (p.budget || perPotje[p.code])).map(balk).join("");
+  const klaar = verstreken(S.maand) >= 1;
+  const toon = (p) => p.budget || p.nulDoel || perPotje[p.code] || abnDeel(p.code);
+  const groepKaart = (groep, titel) => {
+    const leden = potjeLijst().filter((p) => p.groep === groep);
+    if (!leden.length) return "";
+    const besteed = leden.reduce((s, p) => s - totaal(p.code), 0);
+    const budget = leden.reduce((s, p) => s + (p.budget || 0), 0);
+    const pct = budget ? besteed / budget : 0;
+    const kleur = kleurVoor({ budget, soort: "uitgave" }, besteed);
+    return `<div class="kaart groep"><div class="potje-kop"><h2>${esc(titel)}</h2><span><b>${eur(besteed)}</b> <small>/ ${eur(budget)}</small></span></div>
+      <div class="balk dik"><div class="vul ${kleur}" style="width:${Math.min(100, Math.max(0, pct * 100))}%"></div></div>
+      <div class="over ${kleur}">${overTekst({ budget, soort: "uitgave" }, besteed, klaar)}</div>
+      <div class="groep-leden">${leden.filter(toon).map(balk).join("")}</div></div>`;
+  };
+  const groep = (soorten) => potjeLijst().filter((p) => soorten.includes(p.soort) && toon(p)).map(balk).join("");
 
   el.innerHTML = `
-    <div class="maandkeuze"><select id="maand">${maanden.map((m) => `<option value="${m}" ${m === S.maand ? "selected" : ""}>${maandNaam(m)}</option>`).join("")}</select></div>
+    <div class="maandkeuze"><select id="maand">${maanden.map((m) => `<option value="${m}" ${m === S.maand ? "selected" : ""}>${periodeNaam(m)}</option>`).join("")}</select></div>
     ${storno.length ? `<div class="kaart alarm"><b>${storno.length} teruggeboekte incasso${storno.length > 1 ? "'s" : ""}</b> deze maand: ${storno.map((b) => esc(b.tegenpartij)).join(", ")}. Check of die alsnog betaald zijn.</div>` : ""}
     ${nToewijzen ? `<div class="kaart actie" id="naarToewijzen">${nToewijzen} boeking${nToewijzen > 1 ? "en" : ""} deze maand om toe te wijzen →</div>` : ""}
     <div class="kaart"><div class="saldi">${saldi || "<small>Nog geen saldo bekend</small>"}</div>
       <div class="storting ${storting < raboDoelStorting ? "neg" : ""}">Naar Rabo deze maand: <b>${eur(storting)}</b> van ${eur(raboDoelStorting)}</div></div>
-    <div class="kaart"><h2>Rabo, huishouden</h2>${potjeLijst().filter((p) => p.soort === "uitgave" && p.rekening !== "abn" && (p.budget || perPotje[p.code])).map(balk).join("")}</div>
-    <div class="kaart"><h2>ABN, jouw potjes</h2>${potjeLijst().filter((p) => (p.soort === "uitgave" || p.soort === "spaar") && p.rekening === "abn" && (p.budget || perPotje[p.code])).map(balk).join("")}</div>
-    <div class="kaart"><h2>Inkomsten</h2>${inkomen.map(([c, v]) => `<div class="regel"><span>${esc(potjeNaam(c))}</span><b>${eur(v)}</b></div>`).join("")}</div>
-    <div class="kaart"><h2>Zakelijk en apart</h2>${groep(["zakelijk", "apart"]) || "<small>Niets deze maand</small>"}</div>`;
+    ${spaarKaart()}
+    <div class="kaart"><h2>Rabo, huishouden</h2>${potjeLijst().filter((p) => p.soort === "uitgave" && p.rekening !== "abn" && toon(p)).map(balk).join("")}</div>
+    <div class="kaart"><h2>ABN, potjes van Ricky</h2>${potjeLijst().filter((p) => (p.soort === "uitgave" || p.soort === "spaar") && p.rekening === "abn" && !p.groep && toon(p)).map(balk).join("")}</div>
+    ${groepKaart("leefgeld", "Leefgeld")}
+    ${eig ? `<div class="kaart"><h2>Inkomsten</h2>${inkomen.map(([c, v]) => `<div class="regel"><span>${esc(potjeNaam(c))}</span><b>${eur(v)}</b></div>`).join("")}</div>
+    <div class="kaart"><h2>Zakelijk en apart</h2>${groep(["zakelijk", "apart"]) || "<small>Niets deze maand</small>"}</div>` : ""}`;
 
   $("#maand").addEventListener("change", (e) => { S.maand = e.target.value; S.open = null; render(); });
   $("#naarToewijzen")?.addEventListener("click", () => { S.tab = "toewijzen"; render(); });
-  el.querySelectorAll(".potje-kop").forEach((k) => k.addEventListener("click", () => {
+  el.querySelectorAll(".potje-kop.klikbaar").forEach((k) => k.addEventListener("click", () => {
     const c = k.parentElement.dataset.code; S.open = S.open === c ? null : c; render();
   }));
   koppelWijzig(el);
+}
+
+// Kleur: groen = binnen budget of gehaald, geel = net over (max € 10 of 5%), rood = echt over. Sparen: blauw tot het gehaald is.
+function kleurVoor(p, besteed) {
+  if (!p.budget) return "";
+  if (p.soort === "spaar") return besteed >= p.budget - 0.005 ? "groen" : "blauw";
+  const over = besteed - p.budget;
+  if (over <= 0.005) return "groen";
+  return over <= Math.max(10, p.budget * 0.05) ? "geel" : "rood";
+}
+
+function overTekst(p, besteed, klaar) {
+  if (p.soort === "spaar") return besteed >= p.budget - 0.005 ? "gehaald deze maand ✓" : `nog ${eur(p.budget - besteed)} te zetten`;
+  const rest = p.budget - besteed;
+  if (rest >= -0.005) return klaar ? `gehaald ✓ ${eur(rest)} over` : `${eur(rest)} over`;
+  return `${eur(-rest)} over budget`;
+}
+
+function spaarKaart() {
+  const p = S.potjes[spaarpot.potje];
+  if (!p) return "";
+  const overzicht = isEigenaar()
+    ? maandOverzicht([...S.boekingen.values()], spaarpot.potje, spaarpot.uitgavePotje, periodeVanBoeking)
+    : (S.abnSamenvatting.spaar || { maanden: {}, netto: 0 });
+  const vandaag = periodeVandaag();
+  const huidig = S.maand > vandaag ? S.maand : vandaag;
+  if (huidig < spaarpot.startMaand) {
+    return `<div class="kaart spaar"><h2>Spaarpot vakantie</h2><p>Start in ${maandNaam(spaarpot.startMaand)}: zet een automatische overboeking van ${eur(spaarpot.maandDoel)} naar de spaarrekening, op de dag na je salaris.</p></div>`;
+  }
+  const st = spaarStatus(overzicht, { startMaand: spaarpot.startMaand, huidigeMaand: huidig, maandDoel: p.budget || spaarpot.maandDoel,
+    jaarDoel: spaarpot.jaarDoel, startSaldo: p.startSaldo || 0 });
+  const pctJaar = Math.min(100, (st.gespaardDitJaar / st.jaarDoel) * 100);
+  const afk = (m) => new Date(m + "-01T12:00:00").toLocaleDateString("nl-NL", { month: "short" }).replace(".", "");
+  const uitleg = { gelukt: "gelukt", gemist: "niet gezet", aangebroken: "aangebroken", bezig: "loopt nog" };
+  return `<div class="kaart spaar">
+    <div class="spaar-kop"><h2>Spaarpot vakantie</h2><b class="spaar-saldo">${eur(st.saldo)}</b></div>
+    <div class="regel"><span>${st.jaar}: ${eur(st.gespaardDitJaar)} van ${eur(st.jaarDoel)}</span><small>verwacht nu ${eur(st.verwachtDitJaar)}</small></div>
+    <div class="balk"><div class="vul ${st.gespaardDitJaar >= st.verwachtDitJaar ? "groen" : "blauw"}" style="width:${pctJaar}%"></div></div>
+    <div class="vakjes">${st.rij.slice(-12).map((x) => `<div class="vakje ${x.status}" title="${esc(periodeNaam(x.maand))}: ${uitleg[x.status]}${x.storting ? `, ${eur(x.storting)} gezet` : ""}${x.opname ? `, ${eur(x.opname)} opgenomen` : ""}"><span>${afk(x.maand)}</span></div>`).join("")}</div>
+    <div class="spaar-tekst"><b>${st.gelukt} van ${st.afgerond}</b> maanden gelukt${st.reeks > 1 ? ` · <b>${st.reeks} op rij</b>` : ""}</div>
+  </div>`;
 }
 
 function lijstHtml(lijst) {
   if (!lijst.length) return `<div class="lijst"><small>Geen boekingen</small></div>`;
   return `<div class="lijst">${[...lijst].sort((a, b) => b.datum.localeCompare(a.datum)).map((b) =>
     `<div class="boeking"><div><small>${esc(b.datum)} · ${rekNaam(b.rekening)}</small><div>${esc(b.tegenpartij)}</div></div>
-     <div class="rechts"><b class="${b.bedrag < 0 ? "" : "pos"}">${eur2(b.bedrag)}</b><button class="link wijzig" data-id="${esc(b.id)}">wijzig</button></div></div>`).join("")}</div>`;
+     <div class="rechts"><b class="${b.bedrag < 0 ? "" : "pos"}">${eur2(b.bedrag)}</b>${b.potje === spaarpot.potje && b.bedrag > 0 && isEigenaar()
+       ? `<button class="link opname" data-id="${esc(b.id)}">${b.opnameVoorVakantie === false ? "aangebroken" : b.opnameVoorVakantie === true ? "voor vakantie ✓" : "auto"} ↻</button>` : ""}<button class="link wijzig" data-id="${esc(b.id)}">wijzig</button></div></div>`).join("")}</div>`;
 }
 
 function koppelWijzig(el) {
+  el.querySelectorAll(".opname").forEach((btn) => btn.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const b = S.boekingen.get(btn.dataset.id);
+    // auto → voor vakantie → aangebroken → auto
+    const volgende = b.opnameVoorVakantie === undefined || b.opnameVoorVakantie === null ? true : b.opnameVoorVakantie === true ? false : null;
+    await updateDoc(doc(db, "boekingen", b.id), { opnameVoorVakantie: volgende });
+    b.opnameVoorVakantie = volgende;
+    await schrijfSamenvatting();
+    render();
+  }));
   el.querySelectorAll(".wijzig").forEach((btn) => btn.addEventListener("click", (e) => {
     e.stopPropagation();
     const b = S.boekingen.get(btn.dataset.id);
@@ -170,7 +299,7 @@ function koppelWijzig(el) {
 
 // ---------- Toewijzen ----------
 function potjeOpties(huidig) {
-  return potjeLijst().filter((p) => p.soort !== "toewijzen")
+  return potjeLijst().filter((p) => p.soort !== "toewijzen" && (isEigenaar() || !["zakelijk", "inkomen"].includes(p.soort)))
     .map((p) => `<option value="${esc(p.code)}" ${p.code === huidig ? "selected" : ""}>${esc(p.naam)}</option>`).join("");
 }
 
@@ -215,6 +344,7 @@ async function wijsToe(b, potje, onthoud) {
   }
   await inBatches(wijzigingen, (batch, w) => batch.update(doc(db, "boekingen", w.b.id), { potje: w.potje, toegewezenDoor: door, toegewezenOp: serverTimestamp() }));
   wijzigingen.forEach((w) => Object.assign(w.b, { potje: w.potje, toegewezenDoor: door }));
+  await schrijfSamenvatting();
   melding(`${wijzigingen.length} boeking${wijzigingen.length > 1 ? "en" : ""} naar ${potjeNaam(potje)}.`, "ok");
   render();
 }
@@ -224,7 +354,7 @@ function renderImport(el) {
   const imp = S.import;
   el.innerHTML = `
     <div class="kaart"><h2>Bankexport uploaden</h2>
-      <p>ABN: <b>.xls</b> uit Internet Bankieren (Mutaties downloaden). Rabo: <b>.csv</b> (Transacties downloaden). Overlap met eerdere uploads is prima: dubbele boekingen worden overgeslagen.</p>
+      <p>${isEigenaar() ? "" : "Jij kunt de Rabo-export uploaden. "}ABN: <b>.xls</b> uit Internet Bankieren (Mutaties downloaden). Rabo: <b>.csv</b> (Transacties downloaden). Overlap met eerdere uploads is prima: dubbele boekingen worden overgeslagen.</p>
       <input type="file" id="bestand" accept=".xls,.xlsx,.csv,.txt"></div>
     ${imp ? `<div class="kaart"><h2>Voorvertoning ${rekNaam(imp.rekening)}</h2>
       <div class="regel"><span>Periode</span><b>${esc(imp.van)} t/m ${esc(imp.tot)}</b></div>
@@ -237,7 +367,7 @@ function renderImport(el) {
       ${!S.regels.length ? `<p class="neg">Er staan nog geen regels in. Zet eerst bij Instellingen de startregels erin, anders komt alles bij Toewijzen.</p>` : ""}
       <button class="knop" id="opslaan" ${imp.nieuw.length ? "" : "disabled"}>${imp.nieuw.length} boekingen opslaan</button>
       <button class="link" id="annuleer">annuleren</button></div>` : ""}
-    <div class="kaart"><h2>Stand per rekening</h2>${["abn", "rabo"].map((r) => S.rekeningen[r]
+    <div class="kaart"><h2>Stand per rekening</h2>${(isEigenaar() ? ["abn", "rabo"] : ["rabo"]).map((r) => S.rekeningen[r]
       ? `<div class="regel"><span>${rekNaam(r)}</span><span>t/m ${esc(S.rekeningen[r].totDatum)} · ${eur2(S.rekeningen[r].eindSaldo)}</span></div>`
       : `<div class="regel"><span>${rekNaam(r)}</span><small>nog niets</small></div>`).join("")}</div>`;
 
@@ -251,6 +381,7 @@ async function leesBestand(file) {
   try {
     let res;
     if (/\.(xls|xlsx)$/i.test(file.name)) {
+      if (!isEigenaar()) throw new Error("ABN-bestanden kan alleen Ricky importeren.");
       const wb = XLSX.read(await file.arrayBuffer());
       const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, raw: true });
       res = parseAbnRows(rows);
@@ -265,7 +396,7 @@ async function leesBestand(file) {
     for (const b of res.boekingen) {
       if (b.datum < startDatum) { teOud++; continue; }
       if (S.boekingen.has(b.id)) { dubbel++; continue; }
-      nieuw.push({ ...b, ...deelIn(b, S.regels) });
+      nieuw.push({ ...b, ...deelIn(b, S.regels, spaarpot) });
     }
     S.import = { ...res, nieuw, dubbel, teOud, gat: gatControle(S.rekeningen[res.rekening], res), bestand: file.name };
     melding("");
@@ -292,9 +423,10 @@ async function slaImportOp() {
   }
   await addDoc(collection(db, "imports"), { rekening: imp.rekening, bestand: imp.bestand, van: imp.van, tot: imp.tot,
     nieuw: imp.nieuw.length, dubbel: imp.dubbel, door, op: serverTimestamp() });
+  await schrijfSamenvatting();
   melding(`${imp.nieuw.length} boekingen opgeslagen.`, "ok");
   S.import = null;
-  S.maand = imp.tot.slice(0, 7);
+  S.maand = alleMaanden()[0];
   render();
 }
 
@@ -304,6 +436,7 @@ function renderInstellingen(el) {
     <div class="kaart"><h2>Budgetten per maand</h2>
       ${potjeLijst().filter((p) => ["uitgave", "spaar"].includes(p.soort)).map((p) =>
         `<div class="regel"><span>${esc(p.naam)} <small>${rekNaam(p.rekening)}</small></span><input type="number" inputmode="numeric" class="budget" data-code="${esc(p.code)}" value="${p.budget}"></div>`).join("")}
+      ${S.potjes[spaarpot.potje] ? `<div class="regel"><span>Saldo spaarrekening vóór de eerste geïmporteerde overboeking</span><input type="number" inputmode="decimal" id="startSaldo" value="${S.potjes[spaarpot.potje].startSaldo || 0}"></div>` : ""}
       <button class="knop" id="budgetOpslaan">Budgetten opslaan</button></div>
     <div class="kaart"><h2>Regels (${S.regels.length})</h2>
       <p>Startregels inladen: kies <b>regels.json</b> uit de map Potjes/data.</p>
@@ -315,6 +448,13 @@ function renderInstellingen(el) {
     const items = [...el.querySelectorAll(".budget")].map((i) => ({ code: i.dataset.code, budget: Number(i.value) || 0 }));
     await inBatches(items, (b, it) => b.update(doc(db, "potjes", it.code), { budget: it.budget }));
     items.forEach((it) => (S.potjes[it.code].budget = it.budget));
+    const ss = $("#startSaldo");
+    if (ss) {
+      const v = Number(ss.value) || 0;
+      await updateDoc(doc(db, "potjes", spaarpot.potje), { startSaldo: v });
+      S.potjes[spaarpot.potje].startSaldo = v;
+      await schrijfSamenvatting();
+    }
     melding("Budgetten opgeslagen.", "ok");
   });
   $("#regelsBestand").addEventListener("change", async (e) => {
@@ -345,12 +485,13 @@ function renderInstellingen(el) {
     const wijzig = [];
     for (const b of S.boekingen.values()) {
       if (b.toegewezenDoor && b.toegewezenDoor !== "regel") continue; // handmatig: laten staan
-      const d = deelIn(b, S.regels);
+      const d = deelIn(b, S.regels, spaarpot);
       if (d.potje !== b.potje || d.label !== (b.label ?? null)) wijzig.push({ b, d });
     }
     await inBatches(wijzig, (batch, w) => batch.update(doc(db, "boekingen", w.b.id),
       { potje: w.d.potje, label: w.d.label, toegewezenDoor: w.d.potje === "toewijzen" ? null : "regel" }));
     wijzig.forEach((w) => Object.assign(w.b, { potje: w.d.potje, label: w.d.label, toegewezenDoor: w.d.potje === "toewijzen" ? null : "regel" }));
+    await schrijfSamenvatting();
     melding(`${wijzig.length} boekingen opnieuw ingedeeld.`, "ok");
     render();
   });

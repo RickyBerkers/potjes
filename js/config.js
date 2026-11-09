@@ -11,7 +11,20 @@ export const firebaseConfig = {
 // Moet overeenkomen met de lijst in de Firestore-regels.
 export const toegestaneEmails = ["djwicky@gmail.com", "dorienvantuijl1990@gmail.com"];
 
+// Alleen deze gebruiker ziet de ABN-boekingen (ook vastgelegd in de Firestore-regels).
+export const eigenaarEmail = "djwicky@gmail.com";
+
 export const raboDoelStorting = 4800;
 
 // Boekingen van vóór deze datum worden bij het importeren overgeslagen.
 export const startDatum = "2026-01-01";
+
+// Spaarpot vakantie: overboekingen van/naar deze ABN-spaarrekening (NL46 ABNA 0895 1447 35).
+export const spaarpot = {
+  potje: "vakantie",
+  uitgavePotje: "vakantie-uitgaven",
+  rekeningCijfers: "0895144735",
+  maandDoel: 333,
+  jaarDoel: 4000,
+  startMaand: "2026-12",
+};

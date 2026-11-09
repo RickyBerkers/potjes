@@ -21,7 +21,12 @@ export function zoekRegel(boeking, gesorteerdeRegels) {
 }
 
 // Geeft { potje, label, regelId } voor een boeking.
-export function deelIn(boeking, gesorteerdeRegels) {
+export function deelIn(boeking, gesorteerdeRegels, spaar = null) {
+  // Overboekingen van/naar de spaarrekening gaan altijd voor.
+  if (spaar && boeking.rekening === "abn" &&
+      String(boeking.omschrijving || "").replace(/[\s.]/g, "").includes(spaar.rekeningCijfers)) {
+    return { potje: spaar.potje, label: "spaarpot", regelId: null };
+  }
   const r = zoekRegel(boeking, gesorteerdeRegels);
   const label = isStorno(boeking) ? "storno" : (r && r.label) || null;
   return { potje: r ? r.potje : "toewijzen", label, regelId: r ? r.id || null : null };
