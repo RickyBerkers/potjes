@@ -20,13 +20,13 @@ export function isVakantieOpname(opname, vakantieUitgaven) {
 }
 
 // boekingen: alle boekingen; potje: code van de spaarpot; uitgavePotje: code van de vakantie-uitgaven.
-export function maandOverzicht(boekingen, potje, uitgavePotje) {
+export function maandOverzicht(boekingen, potje, uitgavePotje, periodeFn = (b) => b.datum.slice(0, 7)) {
   const pot = boekingen.filter((b) => b.potje === potje);
   const uitgaven = boekingen.filter((b) => b.potje === uitgavePotje && b.bedrag < 0);
   const maanden = {};
   let totaal = 0;
   for (const b of pot) {
-    const m = b.datum.slice(0, 7);
+    const m = periodeFn(b);
     const x = (maanden[m] ||= { storting: 0, opname: 0, aangebroken: false });
     totaal += -b.bedrag; // van de betaalrekening af = in de pot
     if (b.bedrag < 0) x.storting = r2(x.storting - b.bedrag);

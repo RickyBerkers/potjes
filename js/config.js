@@ -28,3 +28,6 @@ export const spaarpot = {
   jaarDoel: 4000,
   startMaand: "2026-12",
 };
+
+// Budgetmaand begint op de dag van het salaris (Devapo betaalt de 27e). Toeslag (20e) valt in dezelfde periode.
+export const periodeStartDag = 27;

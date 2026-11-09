@@ -5,7 +5,7 @@ import * as XLSX from "https://cdn.sheetjs.com/xlsx-0.20.3/package/xlsx.mjs";
 
 import { firebaseConfig, toegestaneEmails, eigenaarEmail, raboDoelStorting, startDatum, spaarpot } from "./config.js";
 import { maandOverzicht, spaarStatus } from "./spaar.js";
-import { periodeVanBoeking, periodeVandaag, periodeNaam, verstreken } from "./periode.js";
+import { periodeVanBoeking, periodeVandaag, periodeNaam, verstreken, volgendePeriode } from "./periode.js";
 import { standaardPotjes } from "./potjes.js";
 import { parseAbnRows, parseRaboCsv, gatControle } from "./parse.js";
 import { sorteerRegels, deelIn } from "./rules.js";
@@ -166,6 +166,11 @@ function renderMaand(el) {
 
   const storting = som((perPotje.intern || []).filter((b) => b.rekening === "rabo" && b.bedrag > 0));
   const inkomen = ["in-salaris", "in-toeslag", "in-omzet"].map((c) => [c, som(perPotje[c])]);
+  // Inkomsten die al binnen zijn maar bij de volgende periode horen (toeslag rond de 20e).
+  const volgende = volgendePeriode(S.maand);
+  const klaargezet = [...S.boekingen.values()]
+    .filter((b) => ["in-salaris", "in-toeslag"].includes(b.potje) && periodeVanBoeking(b) === volgende && b.datum.slice(0, 7) <= S.maand)
+    .reduce((s, b) => s + b.bedrag, 0);
   const storno = deze.filter((b) => b.label === "storno");
   const nToewijzen = (perPotje.toewijzen || []).length;
 
@@ -217,7 +222,8 @@ function renderMaand(el) {
     <div class="kaart"><h2>Rabo, huishouden</h2>${potjeLijst().filter((p) => p.soort === "uitgave" && p.rekening !== "abn" && toon(p)).map(balk).join("")}</div>
     <div class="kaart"><h2>ABN, potjes van Ricky</h2>${potjeLijst().filter((p) => (p.soort === "uitgave" || p.soort === "spaar") && p.rekening === "abn" && !p.groep && toon(p)).map(balk).join("")}</div>
     ${groepKaart("leefgeld", "Leefgeld")}
-    ${eig ? `<div class="kaart"><h2>Inkomsten</h2>${inkomen.map(([c, v]) => `<div class="regel"><span>${esc(potjeNaam(c))}</span><b>${eur(v)}</b></div>`).join("")}</div>
+    ${eig ? `<div class="kaart"><h2>Inkomsten</h2>${inkomen.map(([c, v]) => `<div class="regel"><span>${esc(potjeNaam(c))}</span><b>${eur(v)}</b></div>`).join("")}
+      ${klaargezet ? `<div class="regel klaar"><span>Al binnen voor ${esc(periodeNaam(volgendePeriode(S.maand)).split(" (")[0])}</span><b>${eur(klaargezet)}</b></div>` : ""}</div>
     <div class="kaart"><h2>Zakelijk en apart</h2>${groep(["zakelijk", "apart"]) || "<small>Niets deze maand</small>"}</div>` : ""}`;
 
   $("#maand").addEventListener("change", (e) => { S.maand = e.target.value; S.open = null; render(); });
