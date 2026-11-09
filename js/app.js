@@ -66,11 +66,12 @@ async function laadAlles() {
   S.boekingen = new Map(bSnap.docs.map((d) => [d.id, { id: d.id, ...d.data() }]));
   S.regels = sorteerRegels(rSnap.docs.map((d) => ({ id: d.id, ...d.data() })));
   S.rekeningen = Object.fromEntries(kSnap.docs.map((d) => [d.id, d.data()]));
-  if (pSnap.empty) {
-    await inBatches(standaardPotjes, (b, p) => b.set(doc(db, "potjes", p.code), p));
-    S.potjes = Object.fromEntries(standaardPotjes.map((p) => [p.code, { ...p }]));
-  } else {
-    S.potjes = Object.fromEntries(pSnap.docs.map((d) => [d.id, { code: d.id, ...d.data() }]));
+  S.potjes = Object.fromEntries(pSnap.docs.map((d) => [d.id, { code: d.id, ...d.data() }]));
+  // Nieuwe standaardpotjes (uit een update van de app) aanvullen; bestaande budgetten blijven staan.
+  const ontbrekend = standaardPotjes.filter((p) => !S.potjes[p.code]);
+  if (ontbrekend.length) {
+    await inBatches(ontbrekend, (b, p) => b.set(doc(db, "potjes", p.code), p));
+    ontbrekend.forEach((p) => (S.potjes[p.code] = { ...p }));
   }
   if (!S.maand) {
     const laatste = [...S.boekingen.values()].map((b) => b.datum).sort().at(-1);
@@ -321,13 +322,22 @@ function renderInstellingen(el) {
     if (!f) return;
     try {
       const data = JSON.parse(await f.text());
-      const lijst = (data.regels || data).map((r, i) => ({ rekening: r.rekening, bevat: r.bevat, potje: r.potje, label: r.label || null, volgorde: i + 1 }));
-      const bestaand = new Set(S.regels.map((r) => `${r.rekening}|${String(r.bevat).toLowerCase()}`));
-      const nieuw = lijst.filter((r) => !bestaand.has(`${r.rekening}|${String(r.bevat).toLowerCase()}`));
+      const lijst = (data.regels || data).map((r, i) => ({ rekening: r.rekening, bevat: r.bevat, potje: r.potje,
+        label: r.label || null, woordbegin: !!r.woordbegin, volgorde: r.volgorde ?? i + 1 }));
+      const sleutel = (r) => `${r.rekening}|${String(r.bevat).toLowerCase()}`;
+      const bestaand = new Map(S.regels.map((r) => [sleutel(r), r]));
+      const nieuw = [], gewijzigd = [];
+      for (const r of lijst) {
+        const oud = bestaand.get(sleutel(r));
+        if (!oud) nieuw.push(r);
+        else if (oud.potje !== r.potje || (oud.label ?? null) !== r.label || !!oud.woordbegin !== r.woordbegin || oud.volgorde !== r.volgorde) gewijzigd.push({ oud, r });
+      }
       const refs = nieuw.map(() => doc(collection(db, "regels")));
       await inBatches(nieuw.map((r, i) => [refs[i], r]), (b, [ref, r]) => b.set(ref, r));
+      await inBatches(gewijzigd, (b, { oud, r }) => b.update(doc(db, "regels", oud.id), { potje: r.potje, label: r.label, woordbegin: r.woordbegin, volgorde: r.volgorde }));
+      gewijzigd.forEach(({ oud, r }) => Object.assign(oud, r));
       S.regels = sorteerRegels([...S.regels, ...nieuw.map((r, i) => ({ ...r, id: refs[i].id }))]);
-      melding(`${nieuw.length} regels toegevoegd (${lijst.length - nieuw.length} bestonden al).`, "ok");
+      melding(`${nieuw.length} regels toegevoegd, ${gewijzigd.length} bijgewerkt. Klik nu op "Opnieuw indelen".`, "ok");
       render();
     } catch (err) { melding("Kon regels niet lezen: " + err.message, "fout"); }
   });

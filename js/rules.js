@@ -9,7 +9,13 @@ export function zoekRegel(boeking, gesorteerdeRegels) {
   const hooiberg = `${boeking.tegenpartij || ""} ${boeking.omschrijving || ""}`.toLowerCase();
   for (const r of gesorteerdeRegels) {
     if (r.rekening !== "beide" && r.rekening !== boeking.rekening) continue;
-    if (r.bevat && hooiberg.includes(String(r.bevat).toLowerCase())) return r;
+    if (!r.bevat) continue;
+    const t = String(r.bevat).toLowerCase();
+    if (r.woordbegin) {
+      // Alleen aan het begin van een woord: "SZG" past op "SZG26", niet op "NVZSZGP".
+      const re = new RegExp("(^|[^a-z0-9])" + t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+      if (re.test(hooiberg)) return r;
+    } else if (hooiberg.includes(t)) return r;
   }
   return null;
 }

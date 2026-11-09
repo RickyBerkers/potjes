@@ -11,6 +11,7 @@ export const standaardPotjes = [
   { code: "lening-duo", naam: "Lening en DUO", rekening: "abn", budget: 310, soort: "uitgave", volgorde: 8 },
   { code: "vaste-lasten-abn", naam: "Vaste lasten ABN (zorg, telefoon)", rekening: "abn", budget: 280, soort: "uitgave", volgorde: 9 },
   { code: "leefgeld", naam: "Leefgeld", rekening: "abn", budget: 900, soort: "uitgave", volgorde: 10 },
+  { code: "sport", naam: "Sport en clubs", rekening: "beide", budget: 40, soort: "uitgave", volgorde: 9.5 },
   { code: "vakantie", naam: "Vakantie en uitjes", rekening: "abn", budget: 300, soort: "spaar", volgorde: 11 },
   { code: "buffer", naam: "Buffer", rekening: "abn", budget: 250, soort: "spaar", volgorde: 12 },
   { code: "bedrijfskosten", naam: "Bedrijfskosten", rekening: "abn", budget: 0, soort: "zakelijk", volgorde: 20 },
@@ -20,5 +21,6 @@ export const standaardPotjes = [
   { code: "in-omzet", naam: "Omzet eigen bedrijf", rekening: "abn", budget: 0, soort: "inkomen", volgorde: 32 },
   { code: "intern", naam: "Eigen overboeking (ABN ↔ Rabo)", rekening: "beide", budget: 0, soort: "intern", volgorde: 40 },
   { code: "szg-doorgeefgeld", naam: "SZG doorgeefgeld", rekening: "abn", budget: 0, soort: "apart", volgorde: 41 },
+  { code: "dorien", naam: "Overboekingen met Dorien", rekening: "beide", budget: 0, soort: "apart", volgorde: 42 },
   { code: "toewijzen", naam: "Nog toewijzen", rekening: "beide", budget: 0, soort: "toewijzen", volgorde: 99 },
 ];
